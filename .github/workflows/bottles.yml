@@ -1,0 +1,194 @@
+name: Bottles
+
+# Builds relocatable Homebrew bottles for shelve so `brew install shelve` pours
+# a ~1MB binary instead of compiling and dragging in the Rust toolchain (~2GB of
+# llvm@22 + rust; both paths were verified locally before this file was written).
+#
+# AUTH REQUIRED: needs a `HOMEBREW_TAP_TOKEN` secret on matagus/shelve -- a
+# fine-grained PAT scoped to matagus/homebrew-tap with "Contents: Read and
+# write". The default GITHUB_TOKEN cannot write into another repository, which is
+# why a PAT is unavoidable here. Until that secret exists this workflow skips and
+# the tap keeps working through source builds -- slower, but correct.
+#
+# macOS only: Homebrew on Linux is unsupported (Tier 3), nothing to bottle there.
+#
+# Each matrix leg writes one "<tag> <sha256>" line into a shared artifact rather
+# than a job output: two legs publishing the same output key would overwrite
+# each other and silently drop a platform from the formula.
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to bottle, without the leading v (e.g. 0.4.2)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: matagus/shelve
+  TAP_FULL: matagus/homebrew-tap
+  TAP_NAME: matagus/tap
+  FORMULA: shelve
+
+jobs:
+  bottle:
+    name: Bottle (${{ matrix.label }})
+    if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon + Intel. The bottle tag (`arm64_<codename>` /
+          # `<codename>`) comes from `brew bottle`'s own output instead of being
+          # hardcoded, so a runner image change cannot produce a bottle tagged
+          # for a platform no client will ever select.
+          - label: apple-silicon
+            os: macos-14
+          - label: intel
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Homebrew
+        uses: Homebrew/actions/setup-homebrew@master
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.client_payload.version || inputs.version }}"
+          raw="${raw#v}"
+          if [[ ! "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::could not resolve a semver version from '$raw'"
+            exit 1
+          fi
+          echo "version=$raw" >> "$GITHUB_OUTPUT"
+          echo "tag=v$raw" >> "$GITHUB_OUTPUT"
+
+      - name: Tap formula source
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          set -euo pipefail
+          # Read our formula file, not the generated API copy, which knows
+          # nothing about the bottle being built here.
+          brew tap "${TAP_NAME}" "https://github.com/${TAP_FULL}.git"
+          brew trust "${TAP_NAME}" 2>/dev/null || true
+
+      - name: Build bottle
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "$PWD/out"
+          cd "$PWD/out"
+          brew install --build-bottle "${TAP_NAME}/${FORMULA}"
+          HOMEBREW_BOTTLE_DIR="$PWD" brew bottle --json "${TAP_NAME}/${FORMULA}"
+          ls -l "$PWD"
+
+      - name: Record platform line
+        id: collect
+        run: |
+          set -euo pipefail
+          file="$(ls out/*.tar.gz | head -1)"
+          json="$(ls out/*.json | head -1)"
+          tag="$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(list(d['formula']['bottle_specification']['files'].values())[0]['tag'])" "$json")"
+          sha="$(shasum -a 256 "$file" | awk '{print $1}')"
+          printf '%s %s\n' "$tag" "$sha" > "out/platform-${{ matrix.label }}.txt"
+          echo "bottle $(basename "$file") -> tag=$tag sha256=$sha"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottle-${{ matrix.label }}
+          path: |
+            out/*.tar.gz
+            out/platform-*.txt
+          if-no-files-found: error
+
+  publish:
+    name: Publish bottles
+    needs: [bottle]
+    if: ${{ always() && needs.bottle.result == 'success' && secrets.HOMEBREW_TAP_TOKEN != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.TAP_FULL }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Download bottles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bottle-*
+          merge-multiple: true
+          path: dist
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          raw="${{ github.event.client_payload.version || inputs.version }}"
+          echo "tag=v${raw#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bottles to the upstream release
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ steps.ver.outputs.tag }}" dist/*.tar.gz \
+            --repo "${UPSTREAM_REPO}" --clobber
+          ls -l dist
+
+      - name: Patch formula bottle block
+        env:
+          ROOT_URL: https://github.com/matagus/shelve/releases/download/${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python3 - "Formula/${FORMULA}.rb" <<'PY'
+          import glob, os, re, sys
+          path = sys.argv[1]
+          root = os.environ["ROOT_URL"]
+          pairs = {}
+          for f in sorted(glob.glob("dist/platform-*.txt")):
+              for line in open(f):
+                  line = line.split()
+                  if len(line) == 2:
+                      pairs[line[0]] = line[1]
+          if not pairs:
+              sys.exit("no platform lines found; refusing to write an empty bottle block")
+          lines = "".join(
+              f'    sha256 cellar: :any_skip_relocation, {t}: "{s}"\n'
+              for t, s in sorted(pairs.items())
+          )
+          stanza = f"  bottle do\n    root_url \"{root}\"\n{lines}  end\n\n"
+          src = open(path).read()
+          src = re.sub(r"^  bottle do\n(?:.*?\n)*?^  end\n\n", "", src, flags=re.M)
+          anchor = '  depends_on "rust" => :build\n'
+          if anchor not in src:
+              sys.exit("anchor line not found; refusing to write a broken formula")
+          open(path, "w").write(src.replace(anchor, stanza + anchor, 1))
+          PY
+          git --no-pager diff
+
+      - name: Validate patched formula
+        run: ruby -c "Formula/${FORMULA}.rb"
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          branch: bot/bottles-${{ steps.ver.outputs.tag }}
+          title: "shelve bottles ${{ steps.ver.outputs.tag }}"
+          commit-message: "shelve bottles ${{ steps.ver.outputs.tag }}"
+          body: |
+            Automated bottle publication for ${{ steps.ver.outputs.tag }}.
+
+            Assets are hosted on the
+            [upstream release](https://github.com/matagus/shelve/releases/tag/${{ steps.ver.outputs.tag }}).

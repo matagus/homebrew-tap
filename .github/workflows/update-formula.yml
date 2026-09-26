@@ -2,15 +2,12 @@ name: Update Formula
 
 # Keeps Formula/shelve.rb pointed at the newest shelve release.
 #
-# Triggered by repository_dispatch (event_type: "release") from the shelve
-# repository's release workflow, so publishing a GitHub release is the only
-# step a human has to take. `workflow_dispatch` allows a manual bump, and
-# `push: tags` covers a tag pushed directly onto this tap.
+# Triggered by repository_dispatch (event_type: "release") from matagus/shelve's
+# release workflow. `workflow_dispatch` allows a manual bump. Note that this tap
+# intentionally carries NO version tags: a tag pushed here would re-trigger the
+# `push: tags` event below and double-fire the bump.
 
 on:
-  push:
-    tags:
-      - "v[0-9]+.[0-9]+.[0-9]*"
   repository_dispatch:
     types: [release]
   workflow_dispatch:
@@ -26,10 +23,11 @@ permissions:
 
 env:
   UPSTREAM_REPO: matagus/shelve
+  FORMULA: shelve
 
 jobs:
   bump:
-    name: Bump shelve formula
+    name: Bump source formula
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -40,7 +38,8 @@ jobs:
       - name: Resolve version
         id: ver
         run: |
-          raw="${{ github.event.client_payload.version || github.ref_name || inputs.version }}"
+          set -euo pipefail
+          raw="${{ github.event.client_payload.version || inputs.version }}"
           raw="${raw#v}"
           if [[ ! "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::could not resolve a semver version from '$raw'"
@@ -52,13 +51,12 @@ jobs:
       - name: Compute archive checksum
         id: sum
         run: |
+          set -euo pipefail
           url="https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${{ steps.ver.outputs.tag }}.tar.gz"
           curl -fsSL "$url" -o /tmp/upstream.tar.gz
           sha="$(shasum -a 256 /tmp/upstream.tar.gz | awk '{print $1}')"
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "sha256=$sha" >> "$GITHUB_OUTPUT"
-          echo "url -> $url"
-          echo "sha256 -> $sha"
 
       - name: Rewrite formula
         env:
@@ -66,27 +64,23 @@ jobs:
           SHA256: ${{ steps.sum.outputs.sha256 }}
         run: |
           set -euo pipefail
-          file=Formula/shelve.rb
-          # Anchor each substitution to the start of its own line. Ruby hands
-          # `$` an anchor that also matches before a newline when /m is used, so
-          # keep /m off these two patterns or the block below gets swallowed.
+          # Do NOT add /m to these patterns: under /m, `$` also matches before a
+          # newline, so `^  url ".*"$` would swallow every line below it.
           ruby -i -pe '
-            sub(/^  url ".*"$/)     { %(  url "#{ENV["URL"]}") }
-            sub(/^  sha256 ".*"$/)  { %(  sha256 "#{ENV["SHA256"]}") }
-          ' "$file"
+            sub(/^  url ".*"$/)    { %(  url "#{ENV["URL"]}") }
+            sub(/^  sha256 ".*"$/) { %(  sha256 "#{ENV["SHA256"]}") }
+          ' "Formula/${FORMULA}.rb"
           git --no-pager diff
 
-      - name: Validate with brew style and audit
+      - name: Validate
         run: |
           set -euo pipefail
-          brew style Formula/shelve.rb
-          # Tap formulas are audited by path; `--formula` expects an installed
-          # tap name, which does not exist yet in this checkout.
-          brew audit --strict --new-formula Formula/shelve.rb || \
-            brew audit --strict Formula/shelve.rb
+          brew tap "${{ github.repository }}"
+          brew trust --formula "${{ github.repository }}/Formula/${FORMULA}.rb" 2>/dev/null || true
+          brew style "Formula/${FORMULA}.rb"
+          brew audit --strict "${{ github.repository }}/Formula/${FORMULA}.rb"
 
       - name: Open pull request
-        id: pr
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
