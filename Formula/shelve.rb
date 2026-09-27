@@ -1,8 +1,8 @@
 class Shelve < Formula
   desc "Pretty-print CSV files grouped by a column"
   homepage "https://github.com/matagus/shelve"
-  url "https://github.com/matagus/shelve/archive/refs/tags/v0.4.2.tar.gz"
-  sha256 "a6c7b3f796ec33a0d5abdcf35d9f61e83bb21633d3721454efc8c9e2874cf455"
+  url "https://github.com/matagus/shelve/archive/refs/tags/v0.5.0.tar.gz"
+  sha256 "bd72e1a879cfa75f9fcda66d01aa8949db3c7451250d5c434711e0376b224b7f"
   license "MIT"
   head "https://github.com/matagus/shelve.git", branch: "main"
 
