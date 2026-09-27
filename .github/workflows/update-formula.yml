@@ -75,10 +75,13 @@ jobs:
       - name: Validate
         run: |
           set -euo pipefail
-          brew tap "${{ github.repository }}"
-          brew trust --formula "${{ github.repository }}/Formula/${FORMULA}.rb" 2>/dev/null || true
+          # The tap is owner/repo => matagus/tap. `brew tap <repo>` would
+          # register it under the wrong name ("homebrew-tap").
+          brew tap matagus/tap
           brew style "Formula/${FORMULA}.rb"
-          brew audit --strict "${{ github.repository }}/Formula/${FORMULA}.rb"
+          # Homebrew disabled `brew audit <path>`; pass the formula name and let
+          # it resolve through the registered tap.
+          brew audit --strict "${FORMULA}"
 
       - name: Open pull request
         uses: peter-evans/create-pull-request@v7
